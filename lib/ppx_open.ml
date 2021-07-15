@@ -1,9 +1,263 @@
 open Base
 open Ppxlib
+open Ocaml_common
 
 let name = "open"
 
 module Payload = struct
+  module Type = struct
+    type kind =
+      | Kind_open
+      | Kind_closed
+
+    type t =
+      { type_ident : string
+      ; type_alias : string option
+      ; type_kind : kind
+      }
+
+    (** [pattern] defines the [Ast_pattern.t] for the [Type.t]
+        payload within the [%%open ...] extension hook.type_ident
+        
+        We define the following syntax for a type:
+          type ::= type_ident [attrs]
+          type_ident ::= [%type] ident
+          attrs ::= [@open] [@as ident]
+          ident ::= Lident string *)
+
+    let pattern () =
+      let open Ast_pattern in
+      let ident () = pexp_ident (lident __) in
+      let as_attr =
+        attribute ~name:(string "as") ~payload:(pstr (pstr_eval (ident ()) nil ^:: nil))
+      in
+      let open_attr = attribute ~name:(string "open") ~payload:(pstr nil) |> map0 ~f:Kind_open in
+      let attrs =
+        let as_attrs () = alt_option (as_attr ^:: nil) nil in
+        let open_attrs =
+          alt_option (open_attr ^:: as_attrs ()) (as_attrs ())
+          |> map1 ~f:(Option.value ~default:Kind_closed)
+        in
+        open_attrs
+      in
+      let type_ext = pexp_extension (extension (string "type") (pstr nil)) in
+      let type_ident = pexp_apply type_ext (no_label (ident ()) ^:: nil) in
+      pexp_attributes attrs type_ident
+      |> pack3
+      |> map1 ~f:(fun (type_kind, type_alias, type_ident) -> { type_ident; type_alias; type_kind })
+
+
+    (** TODO: Provide documentation for lazy types. Copied from [ppx_import] *)
+    let env =
+      lazy
+        (Clflags.recursive_types := true;
+         Compmisc.init_path false;
+         Compmisc.initial_env ())
+
+
+    let find_type ~loc env mod_ident type_ident =
+      (* TODO: Document usage of compiler internals*)
+      try
+        let mod_path = Env.lookup_module ~load:true ~loc mod_ident env in
+        let type_path = Path.(Pdot (mod_path, type_ident)) in
+        Some (Env.find_type type_path env)
+      with
+      (* Ignore the deprecation warning for [Not_found] produced by [Base]. *)
+      | (Not_found[@warning "-3"]) -> None
+
+
+    open Types
+
+    let rec lident_of_path path =
+      let open Path in
+      match path with
+      | Pident ident -> Lident (Ident.name ident)
+      | Pdot (path, name) -> Ldot (lident_of_path path, name)
+      | Papply (path1, path2) -> Lapply (lident_of_path path1, lident_of_path path2)
+
+
+    let rec pcore_type_of_ttype_expr ~loc type_expr =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      match type_expr.desc with
+      | Tvar None | Tunivar None ->
+        (* Type variables:
+        
+           Unbound variables may be mapped to [_] type variables, 
+           defined by [ptyp_any]. 
+        *)
+        ptyp_any
+      | Tvar (Some tv) | Tunivar (Some tv) ->
+        (* Type variables:
+        
+           Bounded variables may be mapped to their [Parsetree] equivalent. 
+        *)
+        ptyp_var tv
+      | Tarrow (arg_label, lhs, rhs, _) ->
+        (* Arrow types (functions):
+        
+           For arrow types [lhs -> rhs] (with optional arg_label), we simply
+           recurively convert the [lhs, rhs] using the [Parsetree] equivalent [ptyp_arrow].
+
+           Note that the [arg_label] must be migrated to it's [Parsetree] equivalent using
+           [TODO]. 
+
+           Note that we ignore the [commutable] flag (3). TODO: Understand usage.
+        *)
+        ptyp_arrow arg_label (pcore_type_of_ttype_expr ~loc lhs) (pcore_type_of_ttype_expr ~loc rhs)
+      | Ttuple tys ->
+        (* Tuple type:
+        
+           As with arrow types, recursively convert the types and then construct
+           the tuple type using the [Parsingtree] equivalent [ptyp_tuple].  
+        *)
+        ptyp_tuple (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys)
+      | Tconstr (path, tys, _) ->
+        (* Type constructors:
+        
+           Convert the path to the [Longident.t]. Then recursively convert the applied types.
+           
+           We ignore the [abbrev_memo ref] value (2) since it
+           is used in internal compiler libraries (for tracking known expansions of a type alias). 
+           
+           Examples: int, int list, ('a, 'b, 'c) Ast_pattern.t
+        *)
+        let lident = Located.mk (lident_of_path path) in
+        ptyp_constr lident (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys)
+      | Tvariant { row_fields; row_closed; _ } ->
+        (* Polymorphic variants:
+        
+           Determining the [closed_flag] is simple, since the [row_desc] type
+           contains [row_closed] [bool]. 
+
+           [row_fields] is a associative list of [label]s and [row_field] variants:
+           - [Rpresent [ty]] denotes the variant [`label [of ty]]. 
+           - [Reither (constr:bool, tys, _, _)]: [constr] denotes whether field is a constant (empty) constructor, [tys] is a list of [type_expr] (but used for???) 
+           - [Rabsent] is used for merging '&' constraints in poylmorphic viarants (hence we ignore it).
+        *)
+        let closed_flag = if row_closed then Closed else Open in
+        let fields =
+          row_fields
+          |> List.filter_map ~f:(fun (label, row_field) ->
+                 let label = Located.mk label in
+                 match row_field with
+                 | Rpresent None -> Some (rtag label true [])
+                 | Rpresent (Some ty) ->
+                   Some (rtag label false [ pcore_type_of_ttype_expr ~loc ty ])
+                 | Reither (constr, tys, _, _) ->
+                   Some (rtag label constr (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys))
+                 | _ -> None)
+        in
+        ptyp_variant fields closed_flag None
+      | Tpackage (path, lidents, tys) ->
+        (* Package consists of a module path [path] and a list of type constraints, 
+           defined by [lidents] and [tys] (newer compiler verisions 
+           provide a zipped list). 
+        
+           Examples: (module S) or (module S with type t1 = T1 and ...)
+        *)
+        let lident_tys =
+          List.map2_exn lidents tys ~f:(fun lident ty ->
+              Located.mk lident, pcore_type_of_ttype_expr ~loc ty)
+        in
+        ptyp_package (Located.mk (lident_of_path path), lident_tys)
+      | Tpoly (ty, tys) ->
+        (* Polymorphic type (forall):
+
+           [tys] is the list of type variables (hence should be [Tunivar]s) 
+           and [ty] is the qualified type. 
+           
+           Example: ('a 'b 'c) ty
+        *)
+        let tvs =
+          tys
+          |> List.filter_map ~f:(fun ty ->
+                 match ty.desc with
+                 | Tunivar tv -> Option.(tv >>| Located.mk)
+                 | _ -> None)
+        in
+        ptyp_poly tvs (pcore_type_of_ttype_expr ~loc ty)
+      | Tlink _ | Tsubst _ | Tnil | Tfield _ | Tobject _ ->
+        (* [Tlink] and [Tsubst] are used internally by the compiler. 
+           [Tnil], [Tfield] and [Tobject] are used for object types (not supported).    
+        *)
+        assert false
+
+
+    let plabel_decl_of_tlabel_decl ~loc label =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      let name = Located.mk (Ident.name label.ld_id) in
+      label_declaration
+        ~name
+        ~mutable_:label.ld_mutable
+        ~type_:(pcore_type_of_ttype_expr ~loc label.ld_type)
+
+
+    let pconstr_decl_of_tconstr_decl ~loc constr =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      let name = Located.mk (Ident.name constr.cd_id) in
+      let args =
+        match constr.cd_args with
+        | Cstr_tuple tys -> Pcstr_tuple (List.map tys ~f:(pcore_type_of_ttype_expr ~loc))
+        | Cstr_record labels -> Pcstr_record (List.map labels ~f:(plabel_decl_of_tlabel_decl ~loc))
+      in
+      let res = Option.(constr.cd_res >>| pcore_type_of_ttype_expr ~loc) in
+      constructor_declaration ~name ~args ~res
+
+
+    let ptype_kind_of_ttype_decl_kind ~loc kind =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      match kind with
+      | Type_abstract -> Ptype_abstract
+      | Type_open -> Ptype_open
+      | Type_record (labels, _) ->
+        Ptype_record (List.map labels ~f:(plabel_decl_of_tlabel_decl ~loc))
+      | Type_variant constrs ->
+        Ptype_variant (List.map constrs ~f:(pconstr_decl_of_tconstr_decl ~loc))
+
+
+    let ptype_params_and_cstrs_of_ttype_params ~loc params =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      let fresh_tvar =
+        let i = ref 0 in
+        fun () ->
+          let tv = "a" ^ Int.to_string !i in
+          Int.incr i;
+          ptyp_var tv
+      in
+      let params, constraints =
+        params
+        |> List.map ~f:(fun param ->
+               match param.desc with
+               | Tvar _ -> (pcore_type_of_ttype_expr ~loc param, Invariant), None
+               | _ ->
+                 let tv = fresh_tvar () in
+                 (tv, Invariant), Some (tv, pcore_type_of_ttype_expr ~loc param, loc))
+        |> List.unzip
+      in
+      params, List.filter_opt constraints
+
+
+    let ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl = 
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      let name = Located.mk name in
+      let (params, cstrs) = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
+      let kind = ptype_kind_of_ttype_decl_kind ~loc ttype_decl.type_kind in
+      let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
+        (* TODO: Raise error on private types *)
+        type_declaration ~name ~params ~cstrs ~kind ~manifest ~private_:Public
+
+
+    let expand ~loc:_ _ _ = 
+      (* TODO *)
+      assert false
+  end
+
   module Value = struct
     type t =
       { val_ident : string
@@ -14,7 +268,7 @@ module Payload = struct
         [Value.t] payload within the [%%open ...] extension hook.
         
         We define the following syntax for a value:
-          value  ::= ident [attr] 
+          value  ::= ident [attrs] 
           attrs ::= [@as ident]
           ident ::= Lident string 
     *)
@@ -41,9 +295,27 @@ module Payload = struct
         ]
   end
 
+  module Item = struct
+    type t =
+      | Type of Type.t
+      | Value of Value.t
+
+    let pattern () =
+      let open Ast_pattern in
+      Value.pattern ()
+      |> map1 ~f:(fun v -> Value v)
+      ||| (Type.pattern () |> map1 ~f:(fun t -> Type t))
+
+
+    let expand ~loc mod_ident item =
+      match item with
+      | Type t -> Type.expand ~loc mod_ident t
+      | Value v -> Value.expand ~loc mod_ident v
+  end
+
   type t =
     { open_mod_ident : Longident.t
-    ; open_values : Value.t list
+    ; open_items : Item.t list
     }
 
   (** [pattern] defines then [Ast_pattern.t] for the 
@@ -53,26 +325,31 @@ module Payload = struct
     payload of the [%%open ...] extension hook:
       payload ::= mod_ident.( items ) 
       items   ::= item | item, items
-      item    ::= value
+      item    ::= value | type
  *)
   let pattern () =
     let open Ast_pattern in
-    let item = Value.pattern in
-    let items = item () |> map1 ~f:(fun item -> [ item ]) ||| pexp_tuple (many (item ())) in
+    let items =
+      Item.pattern () |> map1 ~f:(fun item -> [ item ]) ||| pexp_tuple (many (Item.pattern ()))
+    in
     let mod_ident = open_infos ~override:fresh ~expr:(pmod_ident __) in
     pstr (pstr_eval (pexp_open mod_ident items) nil ^:: nil)
-    |> map2 ~f:(fun open_mod_ident open_values -> { open_mod_ident; open_values })
+    |> map2 ~f:(fun open_mod_ident open_items -> { open_mod_ident; open_items })
 
 
-  let expand ~loc { open_mod_ident; open_values } =
+  let expand ~loc { open_mod_ident; open_items } =
     let (module B) = Ast_builder.make loc in
     let open B in
-    let value_bindings = List.map ~f:(Value.expand ~loc open_mod_ident) open_values in
+    let value_bindings = List.map ~f:(Item.expand ~loc open_mod_ident) open_items in
     pstr_open (open_infos ~override:Fresh ~expr:(pmod_structure value_bindings))
 end
 
 let pattern = Payload.pattern ()
-let expand ~ctxt payload = Payload.expand ~loc:(Expansion_context.Extension.extension_point_loc ctxt) payload
+
+let expand ~ctxt payload =
+  Payload.expand ~loc:(Expansion_context.Extension.extension_point_loc ctxt) payload
+
+
 let open_extension = Extension.V3.declare name Extension.Context.structure_item pattern expand
 let open_rule = Context_free.Rule.extension open_extension
 let () = Driver.register_transformation ~rules:[ open_rule ] name
