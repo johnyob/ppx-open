@@ -6,6 +6,15 @@ let name = "open"
 let raise_errorf = Location.raise_errorf
 
 module Payload = struct
+  (* 
+  module Module_type = struct
+
+  end
+
+  module Module = struct
+
+  end *)
+
   module Type = struct
     type kind =
       | Kind_open
@@ -56,16 +65,16 @@ module Payload = struct
         "(" ^ string_of_lident lident1 ^ ")" ^ "(" ^ string_of_lident lident2 ^ ")"
 
 
-    (* 
+    
     let string_of_env env = 
       Env.diff Env.empty env
       |> List.map ~f:(Ident.name)
-      |> String.concat ~sep:", " *)
+      |> String.concat ~sep:", "
 
     let env =
-      Clflags.recursive_types := true;
-      Compmisc.init_path false;
-      Compmisc.initial_env ()
+      lazy
+        (Compmisc.init_path false;
+         Compmisc.initial_env ())
 
 
     let find_type ~loc env mod_ident type_name =
@@ -77,10 +86,8 @@ module Payload = struct
       with
       (* Ignore the deprecation warning for [Not_found] produced by [Base]. *)
       | (Not_found[@warning "-3"]) ->
-        raise_errorf "[%%open]: cannot find type %s.%s." (string_of_lident mod_ident) type_name
-
-
-    (* (string_of_env) *)
+        raise_errorf "[%%open]: cannot find type %s.%s. %s" (string_of_lident mod_ident) type_name
+        (string_of_env env)
 
     open Types
 
@@ -293,7 +300,7 @@ module Payload = struct
       let (module B) = Ast_builder.make loc in
       let open B in
       let name = Option.value type_alias ~default:type_ident in
-      let ttype_decl = find_type ~loc env mod_ident type_ident in
+      let ttype_decl = find_type ~loc (Lazy.force_val env) mod_ident type_ident in
       let ptype_lident = Ldot (mod_ident, type_ident) in
       let ptype_decl =
         match type_kind with
