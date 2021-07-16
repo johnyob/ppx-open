@@ -3,6 +3,7 @@ open Ppxlib
 open Ocaml_common
 
 let name = "open"
+let raise_errorf = Location.raise_errorf
 
 module Payload = struct
   module Type = struct
@@ -47,24 +48,39 @@ module Payload = struct
       |> map1 ~f:(fun (type_kind, type_alias, type_ident) -> { type_ident; type_alias; type_kind })
 
 
-    (** TODO: Provide documentation for lazy types. Copied from [ppx_import] *)
+    let rec string_of_lident lident =
+      match lident with
+      | Lident name -> name
+      | Ldot (lident, name) -> string_of_lident lident ^ "." ^ name
+      | Lapply (lident1, lident2) ->
+        "(" ^ string_of_lident lident1 ^ ")" ^ "(" ^ string_of_lident lident2 ^ ")"
+
+
+    (* 
+    let string_of_env env = 
+      Env.diff Env.empty env
+      |> List.map ~f:(Ident.name)
+      |> String.concat ~sep:", " *)
+
     let env =
-      lazy
-        (Clflags.recursive_types := true;
-         Compmisc.init_path false;
-         Compmisc.initial_env ())
+      Clflags.recursive_types := true;
+      Compmisc.init_path false;
+      Compmisc.initial_env ()
 
 
-    let find_type ~loc env mod_ident type_ident =
+    let find_type ~loc env mod_ident type_name =
       (* TODO: Document usage of compiler internals*)
       try
         let mod_path = Env.lookup_module ~load:true ~loc mod_ident env in
-        let type_path = Path.(Pdot (mod_path, type_ident)) in
-        Some (Env.find_type type_path env)
+        let type_path = Path.(Pdot (mod_path, type_name)) in
+        Env.find_type type_path env
       with
       (* Ignore the deprecation warning for [Not_found] produced by [Base]. *)
-      | (Not_found[@warning "-3"]) -> None
+      | (Not_found[@warning "-3"]) ->
+        raise_errorf "[%%open]: cannot find type %s.%s." (string_of_lident mod_ident) type_name
 
+
+    (* (string_of_env) *)
 
     open Types
 
@@ -100,11 +116,14 @@ module Payload = struct
            recurively convert the [lhs, rhs] using the [Parsetree] equivalent [ptyp_arrow].
 
            Note that the [arg_label] must be migrated to it's [Parsetree] equivalent using
-           [TODO]. 
+           [migrate_arg_label]. 
 
            Note that we ignore the [commutable] flag (3). TODO: Understand usage.
         *)
-        ptyp_arrow arg_label (pcore_type_of_ttype_expr ~loc lhs) (pcore_type_of_ttype_expr ~loc rhs)
+        ptyp_arrow
+          (Migrate.arg_label arg_label)
+          (pcore_type_of_ttype_expr ~loc lhs)
+          (pcore_type_of_ttype_expr ~loc rhs)
       | Ttuple tys ->
         (* Tuple type:
         
@@ -132,7 +151,7 @@ module Payload = struct
 
            [row_fields] is a associative list of [label]s and [row_field] variants:
            - [Rpresent [ty]] denotes the variant [`label [of ty]]. 
-           - [Reither (constr:bool, tys, _, _)]: [constr] denotes whether field is a constant (empty) constructor, [tys] is a list of [type_expr] (but used for???) 
+           - [Reither (constr:bool, tys, _, _)]: [constr] denotes whether field is a constant (empty) constructor, [tys] is a list of [type_expr]
            - [Rabsent] is used for merging '&' constraints in poylmorphic viarants (hence we ignore it).
         *)
         let closed_flag = if row_closed then Closed else Open in
@@ -177,10 +196,11 @@ module Payload = struct
                  | _ -> None)
         in
         ptyp_poly tvs (pcore_type_of_ttype_expr ~loc ty)
-      | Tlink _ | Tsubst _ | Tnil | Tfield _ | Tobject _ ->
-        (* [Tlink] and [Tsubst] are used internally by the compiler. 
-           [Tnil], [Tfield] and [Tobject] are used for object types (not supported).    
-        *)
+      | Tnil | Tfield _ | Tobject _ ->
+        (* [Tnil], [Tfield] and [Tobject] are used for object types (not supported) *)
+        raise_errorf ~loc "[%%open]: object types are not supported."
+      | Tlink _ | Tsubst _ ->
+        (* [Tlink] and [Tsubst] are used internally by the compiler. *)
         assert false
 
 
@@ -190,7 +210,7 @@ module Payload = struct
       let name = Located.mk (Ident.name label.ld_id) in
       label_declaration
         ~name
-        ~mutable_:label.ld_mutable
+        ~mutable_:(Migrate.mutable_flag label.ld_mutable)
         ~type_:(pcore_type_of_ttype_expr ~loc label.ld_type)
 
 
@@ -242,20 +262,45 @@ module Payload = struct
       params, List.filter_opt constraints
 
 
-    let ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl = 
+    let open_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl =
       let (module B) = Ast_builder.make loc in
       let open B in
-      let name = Located.mk name in
-      let (params, cstrs) = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
-      let kind = ptype_kind_of_ttype_decl_kind ~loc ttype_decl.type_kind in
-      let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
-        (* TODO: Raise error on private types *)
+      match ttype_decl.type_private with
+      | Private -> raise_errorf "[%%open]: cannot open a private type."
+      | Public ->
+        let name = Located.mk name in
+        let params, cstrs = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
+        let kind = ptype_kind_of_ttype_decl_kind ~loc ttype_decl.type_kind in
+        let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
         type_declaration ~name ~params ~cstrs ~kind ~manifest ~private_:Public
 
 
-    let expand ~loc:_ _ _ = 
-      (* TODO *)
-      assert false
+    let closed_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      let params, _ = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
+      let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
+      type_declaration
+        ~name:(Located.mk name)
+        ~params
+        ~kind:Ptype_abstract
+        ~manifest
+        ~private_:Public
+        ~cstrs:[]
+
+
+    let expand ~loc mod_ident { type_ident; type_alias; type_kind } =
+      let (module B) = Ast_builder.make loc in
+      let open B in
+      let name = Option.value type_alias ~default:type_ident in
+      let ttype_decl = find_type ~loc env mod_ident type_ident in
+      let ptype_lident = Ldot (mod_ident, type_ident) in
+      let ptype_decl =
+        match type_kind with
+        | Kind_closed -> closed_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl
+        | Kind_open -> open_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl
+      in
+      pstr_type Nonrecursive [ ptype_decl ]
   end
 
   module Value = struct
