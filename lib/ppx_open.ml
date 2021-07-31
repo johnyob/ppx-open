@@ -6,14 +6,8 @@ let name = "open"
 let raise_errorf = Location.raise_errorf
 
 module Payload = struct
-  (* 
-  module Module_type = struct
-
-  end
-
-  module Module = struct
-
-  end *)
+  module Module_type = struct end
+  module Module = struct end
 
   module Type = struct
     type kind =
@@ -57,6 +51,14 @@ module Payload = struct
       |> map1 ~f:(fun (type_kind, type_alias, type_ident) -> { type_ident; type_alias; type_kind })
 
 
+    let rec string_of_path path =
+      let open Path in
+      match path with
+      | Pident ident -> Ident.name ident
+      | Pdot (path, name) -> string_of_path path ^ "." ^ name
+      | Papply (path1, path2) -> "(" ^ string_of_path path1 ^ ")" ^ "(" ^ string_of_path path2 ^ ")"
+
+
     let rec string_of_lident lident =
       match lident with
       | Lident name -> name
@@ -65,31 +67,91 @@ module Payload = struct
         "(" ^ string_of_lident lident1 ^ ")" ^ "(" ^ string_of_lident lident2 ^ ")"
 
 
-    
-    let string_of_env env = 
-      Env.diff Env.empty env
-      |> List.map ~f:(Ident.name)
-      |> String.concat ~sep:", "
+    let string_of_env env =
+      Env.diff Env.empty env |> List.map ~f:Ident.name |> String.concat ~sep:", "
+
+
+    let lident_flatten lident =
+      try Longident.flatten lident with
+      | _ -> []
+
+
+    let path_flatten path =
+      match Path.flatten path with
+      | `Ok (ident, names) -> Some (ident, names)
+      | `Contains_apply -> None
+
+
+    let path_unflatten (ident, names) =
+      let open Path in
+      let rec loop names =
+        match names with
+        | [] -> Pident ident
+        | name :: names -> Pdot (loop names, name)
+      in
+      loop (List.rev names)
+
 
     let env =
       lazy
-        (Compmisc.init_path false;
+        (Compmisc.init_path ();
          Compmisc.initial_env ())
 
 
-    let find_type ~loc env mod_ident type_name =
-      (* TODO: Document usage of compiler internals*)
-      try
-        let mod_path = Env.lookup_module ~load:true ~loc mod_ident env in
-        let type_path = Path.(Pdot (mod_path, type_name)) in
-        Env.find_type type_path env
-      with
-      (* Ignore the deprecation warning for [Not_found] produced by [Base]. *)
-      | (Not_found[@warning "-3"]) ->
-        raise_errorf "[%%open]: cannot find type %s.%s. %s" (string_of_lident mod_ident) type_name
-        (string_of_env env)
-
     open Types
+
+    let find_module_type_by_module ~loc env mod_ident =
+      let path = Env.lookup_module ~loc mod_ident env |> fst in
+      Option.try_with (fun () -> (Env.find_module path env).md_type)
+
+
+    let find_module_type_by_module_type env mod_ident =
+      Option.try_with (fun () ->
+          Option.value_exn
+            (Env.find_modtype_by_name mod_ident env
+            |> fun (_, module_type_decl) -> module_type_decl.mtd_type))
+
+
+    let find_module_type ~loc env mod_ident =
+      match find_module_type_by_module ~loc env mod_ident with
+      | Some module_type -> module_type
+      | None ->
+        (match find_module_type_by_module_type env mod_ident with
+        | Some module_type -> module_type
+        | None -> raise_errorf ~loc "[%%open]: cannot find module %s" (string_of_lident mod_ident))
+
+
+    let find_type ~loc path env =
+      try Env.find_type path env with
+      | (Not_found[@warning "-3"]) ->
+        raise_errorf ~loc "[%%open]: cannot find type %s." (string_of_path path)
+
+
+    let rec signature_of_module_type ~loc env module_type =
+      match module_type with
+      | Mty_signature signature -> signature
+      | Mty_functor _ -> raise_errorf ~loc "[%%open]: cannot access signature of functor."
+      | Mty_ident path | Mty_alias path ->
+        (match Env.find_module path env with
+        | module_decl -> signature_of_module_type ~loc env module_decl.md_type
+        | exception (Not_found[@warning "-3"]) ->
+          raise_errorf ~loc "[%%open]: cannot find module %s." (string_of_path path))
+
+
+    let find_type ~loc env mod_ident type_name =
+      match lident_flatten mod_ident with
+      | head :: names ->
+        let mod_type = find_module_type ~loc env (Lident head) in
+        let signature = signature_of_module_type ~loc env mod_type in
+        let ident = Ident.create_persistent head in
+        let env' = Env.add_module ident Mp_present (Mty_signature signature) env in
+        find_type ~loc  (path_unflatten (ident, names @ [ type_name ])) env'
+      | _ ->
+        raise_errorf
+          ~loc
+          "[%%open]: cannot open a functor application %s"
+          (string_of_lident mod_ident)
+
 
     let rec lident_of_path path =
       let open Path in
@@ -102,7 +164,7 @@ module Payload = struct
     let rec pcore_type_of_ttype_expr ~loc type_expr =
       let (module B) = Ast_builder.make loc in
       let open B in
-      match type_expr.desc with
+      match (Ctype.repr type_expr).desc with
       | Tvar None | Tunivar None ->
         (* Type variables:
         
@@ -260,10 +322,11 @@ module Payload = struct
         params
         |> List.map ~f:(fun param ->
                match param.desc with
-               | Tvar _ -> (pcore_type_of_ttype_expr ~loc param, Invariant), None
+               | Tvar _ -> (pcore_type_of_ttype_expr ~loc param, (NoVariance, NoInjectivity)), None
                | _ ->
                  let tv = fresh_tvar () in
-                 (tv, Invariant), Some (tv, pcore_type_of_ttype_expr ~loc param, loc))
+                 ( (tv, (NoVariance, NoInjectivity))
+                 , Some (tv, pcore_type_of_ttype_expr ~loc param, loc) ))
         |> List.unzip
       in
       params, List.filter_opt constraints
@@ -389,6 +452,12 @@ module Payload = struct
     |> map2 ~f:(fun open_mod_ident open_items -> { open_mod_ident; open_items })
 
 
+  let expand_ocamldep ~loc { open_mod_ident; _ } =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    pstr_open (open_infos ~override:Fresh ~expr:(pmod_ident (Located.mk open_mod_ident)))
+
+
   let expand ~loc { open_mod_ident; open_items } =
     let (module B) = Ast_builder.make loc in
     let open B in
@@ -399,7 +468,12 @@ end
 let pattern = Payload.pattern ()
 
 let expand ~ctxt payload =
-  Payload.expand ~loc:(Expansion_context.Extension.extension_point_loc ctxt) payload
+  let tool_name = Expansion_context.Extension.tool_name ctxt in
+  let loc = Expansion_context.Extension.extension_point_loc ctxt in
+  let expander =
+    if String.equal tool_name "ocamldep" then Payload.expand_ocamldep else Payload.expand
+  in
+  expander ~loc payload
 
 
 let open_extension = Extension.V3.declare name Extension.Context.structure_item pattern expand
