@@ -1,11 +1,15 @@
 (lang dune 2.8)
+
 (name ppx_open)
 
 (generate_opam_files true)
 
 (license MIT)
+
 (maintainers "ajo41@cam.ac.uk")
+
 (authors "Alistair O'Brien")
+
 (source
  (github johnyob/ppx-open))
 
@@ -16,6 +20,11 @@
   "A ppx rewriter that provides idiomatic selective `open`s in OCaml.")
  (depends
   (ocaml
-   (>= 4.08.0))
+   (>= 4.12.0))
   (dune
-   (>= 2.8))))
+   (>= 2.8))
+  (ppxlib
+   (>= 0.22.2))
+  (base
+   (>= 0.14.1))))
+(using menhir 2.1)

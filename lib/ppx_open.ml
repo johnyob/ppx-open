@@ -2,184 +2,147 @@ open Base
 open Ppxlib
 open Ocaml_common
 
+module Parse = Ppx_open_parsing.Parse
+module Parsed = Ppx_open_parsing.Parsed
+
 let name = "open"
 let raise_errorf = Location.raise_errorf
 
-module Payload = struct
-  module Module_type = struct end
-  module Module = struct end
+module Module_type = struct end
+module Module = struct end
 
-  module Type = struct
-    type kind =
-      | Kind_open
-      | Kind_closed
+module Type = struct
+  include Parsed.Type
 
-    type t =
-      { type_ident : string
-      ; type_alias : string option
-      ; type_kind : kind
-      }
-
-    (** [pattern] defines the [Ast_pattern.t] for the [Type.t]
-        payload within the [%%open ...] extension hook.type_ident
-        
-        We define the following syntax for a type:
-          type ::= type_ident [attrs]
-          type_ident ::= [%type] ident
-          attrs ::= [@open] [@as ident]
-          ident ::= Lident string *)
-
-    let pattern () =
-      let open Ast_pattern in
-      let ident () = pexp_ident (lident __) in
-      let as_attr =
-        attribute ~name:(string "as") ~payload:(pstr (pstr_eval (ident ()) nil ^:: nil))
-      in
-      let open_attr = attribute ~name:(string "open") ~payload:(pstr nil) |> map0 ~f:Kind_open in
-      let attrs =
-        let as_attrs () = alt_option (as_attr ^:: nil) nil in
-        let open_attrs =
-          alt_option (open_attr ^:: as_attrs ()) (as_attrs ())
-          |> map1 ~f:(Option.value ~default:Kind_closed)
-        in
-        open_attrs
-      in
-      let type_ext = pexp_extension (extension (string "type") (pstr nil)) in
-      let type_ident = pexp_apply type_ext (no_label (ident ()) ^:: nil) in
-      pexp_attributes attrs type_ident
-      |> pack3
-      |> map1 ~f:(fun (type_kind, type_alias, type_ident) -> { type_ident; type_alias; type_kind })
+  let rec string_of_path path =
+    let open Path in
+    match path with
+    | Pident ident -> Ident.name ident
+    | Pdot (path, name) -> string_of_path path ^ "." ^ name
+    | Papply (path1, path2) -> "(" ^ string_of_path path1 ^ ")" ^ "(" ^ string_of_path path2 ^ ")"
 
 
-    let rec string_of_path path =
-      let open Path in
-      match path with
-      | Pident ident -> Ident.name ident
-      | Pdot (path, name) -> string_of_path path ^ "." ^ name
-      | Papply (path1, path2) -> "(" ^ string_of_path path1 ^ ")" ^ "(" ^ string_of_path path2 ^ ")"
+  let rec string_of_lident lident =
+    match lident with
+    | Lident name -> name
+    | Ldot (lident, name) -> string_of_lident lident ^ "." ^ name
+    | Lapply (lident1, lident2) ->
+      "(" ^ string_of_lident lident1 ^ ")" ^ "(" ^ string_of_lident lident2 ^ ")"
 
 
-    let rec string_of_lident lident =
-      match lident with
-      | Lident name -> name
-      | Ldot (lident, name) -> string_of_lident lident ^ "." ^ name
-      | Lapply (lident1, lident2) ->
-        "(" ^ string_of_lident lident1 ^ ")" ^ "(" ^ string_of_lident lident2 ^ ")"
+  let string_of_env env =
+    Env.diff Env.empty env |> List.map ~f:Ident.name |> String.concat ~sep:", "
 
 
-    let string_of_env env =
-      Env.diff Env.empty env |> List.map ~f:Ident.name |> String.concat ~sep:", "
+  let lident_flatten lident =
+    try Longident.flatten lident with
+    | _ -> []
 
 
-    let lident_flatten lident =
-      try Longident.flatten lident with
-      | _ -> []
+  let path_flatten path =
+    match Path.flatten path with
+    | `Ok (ident, names) -> Some (ident, names)
+    | `Contains_apply -> None
 
 
-    let path_flatten path =
-      match Path.flatten path with
-      | `Ok (ident, names) -> Some (ident, names)
-      | `Contains_apply -> None
+  let path_unflatten (ident, names) =
+    let open Path in
+    let rec loop names =
+      match names with
+      | [] -> Pident ident
+      | name :: names -> Pdot (loop names, name)
+    in
+    loop (List.rev names)
 
 
-    let path_unflatten (ident, names) =
-      let open Path in
-      let rec loop names =
-        match names with
-        | [] -> Pident ident
-        | name :: names -> Pdot (loop names, name)
-      in
-      loop (List.rev names)
+  let env =
+    lazy
+      (Compmisc.init_path ();
+       Compmisc.initial_env ())
 
 
-    let env =
-      lazy
-        (Compmisc.init_path ();
-         Compmisc.initial_env ())
+  open Types
+
+  let find_module_type_by_module ~loc env mod_ident =
+    let path = Env.lookup_module ~loc mod_ident env |> fst in
+    Option.try_with (fun () -> (Env.find_module path env).md_type)
 
 
-    open Types
-
-    let find_module_type_by_module ~loc env mod_ident =
-      let path = Env.lookup_module ~loc mod_ident env |> fst in
-      Option.try_with (fun () -> (Env.find_module path env).md_type)
-
-
-    let find_module_type_by_module_type env mod_ident =
-      Option.try_with (fun () ->
-          Option.value_exn
-            (Env.find_modtype_by_name mod_ident env
-            |> fun (_, module_type_decl) -> module_type_decl.mtd_type))
+  let find_module_type_by_module_type env mod_ident =
+    Option.try_with (fun () ->
+        Option.value_exn
+          (Env.find_modtype_by_name mod_ident env
+          |> fun (_, module_type_decl) -> module_type_decl.mtd_type))
 
 
-    let find_module_type ~loc env mod_ident =
-      match find_module_type_by_module ~loc env mod_ident with
+  let find_module_type ~loc env mod_ident =
+    match find_module_type_by_module ~loc env mod_ident with
+    | Some module_type -> module_type
+    | None ->
+      (match find_module_type_by_module_type env mod_ident with
       | Some module_type -> module_type
-      | None ->
-        (match find_module_type_by_module_type env mod_ident with
-        | Some module_type -> module_type
-        | None -> raise_errorf ~loc "[%%open]: cannot find module %s" (string_of_lident mod_ident))
+      | None -> raise_errorf ~loc "[%%open]: cannot find module %s" (string_of_lident mod_ident))
 
 
-    let find_type ~loc path env =
-      try Env.find_type path env with
-      | (Not_found[@warning "-3"]) ->
-        raise_errorf ~loc "[%%open]: cannot find type %s." (string_of_path path)
+  let find_type ~loc path env =
+    try Env.find_type path env with
+    | (Not_found[@warning "-3"]) ->
+      raise_errorf ~loc "[%%open]: cannot find type %s." (string_of_path path)
 
 
-    let rec signature_of_module_type ~loc env module_type =
-      match module_type with
-      | Mty_signature signature -> signature
-      | Mty_functor _ -> raise_errorf ~loc "[%%open]: cannot access signature of functor."
-      | Mty_ident path | Mty_alias path ->
-        (match Env.find_module path env with
-        | module_decl -> signature_of_module_type ~loc env module_decl.md_type
-        | exception (Not_found[@warning "-3"]) ->
-          raise_errorf ~loc "[%%open]: cannot find module %s." (string_of_path path))
+  let rec signature_of_module_type ~loc env module_type =
+    match module_type with
+    | Mty_signature signature -> signature
+    | Mty_functor _ -> raise_errorf ~loc "[%%open]: cannot access signature of functor."
+    | Mty_ident path | Mty_alias path ->
+      (match Env.find_module path env with
+      | module_decl -> signature_of_module_type ~loc env module_decl.md_type
+      | exception (Not_found[@warning "-3"]) ->
+        raise_errorf ~loc "[%%open]: cannot find module %s." (string_of_path path))
 
 
-    let find_type ~loc env mod_ident type_name =
-      match lident_flatten mod_ident with
-      | head :: names ->
-        let mod_type = find_module_type ~loc env (Lident head) in
-        let signature = signature_of_module_type ~loc env mod_type in
-        let ident = Ident.create_persistent head in
-        let env' = Env.add_module ident Mp_present (Mty_signature signature) env in
-        find_type ~loc  (path_unflatten (ident, names @ [ type_name ])) env'
-      | _ ->
-        raise_errorf
-          ~loc
-          "[%%open]: cannot open a functor application %s"
-          (string_of_lident mod_ident)
+  let find_type ~loc env mod_ident type_name =
+    match lident_flatten mod_ident with
+    | head :: names ->
+      let mod_type = find_module_type ~loc env (Lident head) in
+      let signature = signature_of_module_type ~loc env mod_type in
+      let ident = Ident.create_persistent head in
+      let env' = Env.add_module ident Mp_present (Mty_signature signature) env in
+      find_type ~loc (path_unflatten (ident, names @ [ type_name ])) env'
+    | _ ->
+      raise_errorf
+        ~loc
+        "[%%open]: cannot open a functor application %s"
+        (string_of_lident mod_ident)
 
 
-    let rec lident_of_path path =
-      let open Path in
-      match path with
-      | Pident ident -> Lident (Ident.name ident)
-      | Pdot (path, name) -> Ldot (lident_of_path path, name)
-      | Papply (path1, path2) -> Lapply (lident_of_path path1, lident_of_path path2)
+  let rec lident_of_path path =
+    let open Path in
+    match path with
+    | Pident ident -> Lident (Ident.name ident)
+    | Pdot (path, name) -> Ldot (lident_of_path path, name)
+    | Papply (path1, path2) -> Lapply (lident_of_path path1, lident_of_path path2)
 
 
-    let rec pcore_type_of_ttype_expr ~loc type_expr =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      match (Ctype.repr type_expr).desc with
-      | Tvar None | Tunivar None ->
-        (* Type variables:
+  let rec pcore_type_of_ttype_expr ~loc type_expr =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    match (Ctype.repr type_expr).desc with
+    | Tvar None | Tunivar None ->
+      (* Type variables:
         
            Unbound variables may be mapped to [_] type variables, 
            defined by [ptyp_any]. 
         *)
-        ptyp_any
-      | Tvar (Some tv) | Tunivar (Some tv) ->
-        (* Type variables:
+      ptyp_any
+    | Tvar (Some tv) | Tunivar (Some tv) ->
+      (* Type variables:
         
            Bounded variables may be mapped to their [Parsetree] equivalent. 
         *)
-        ptyp_var tv
-      | Tarrow (arg_label, lhs, rhs, _) ->
-        (* Arrow types (functions):
+      ptyp_var tv
+    | Tarrow (arg_label, lhs, rhs, _) ->
+      (* Arrow types (functions):
         
            For arrow types [lhs -> rhs] (with optional arg_label), we simply
            recurively convert the [lhs, rhs] using the [Parsetree] equivalent [ptyp_arrow].
@@ -189,19 +152,19 @@ module Payload = struct
 
            Note that we ignore the [commutable] flag (3). TODO: Understand usage.
         *)
-        ptyp_arrow
-          (Migrate.arg_label arg_label)
-          (pcore_type_of_ttype_expr ~loc lhs)
-          (pcore_type_of_ttype_expr ~loc rhs)
-      | Ttuple tys ->
-        (* Tuple type:
+      ptyp_arrow
+        (Migrate.arg_label arg_label)
+        (pcore_type_of_ttype_expr ~loc lhs)
+        (pcore_type_of_ttype_expr ~loc rhs)
+    | Ttuple tys ->
+      (* Tuple type:
         
            As with arrow types, recursively convert the types and then construct
            the tuple type using the [Parsingtree] equivalent [ptyp_tuple].  
         *)
-        ptyp_tuple (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys)
-      | Tconstr (path, tys, _) ->
-        (* Type constructors:
+      ptyp_tuple (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys)
+    | Tconstr (path, tys, _) ->
+      (* Type constructors:
         
            Convert the path to the [Longident.t]. Then recursively convert the applied types.
            
@@ -210,10 +173,10 @@ module Payload = struct
            
            Examples: int, int list, ('a, 'b, 'c) Ast_pattern.t
         *)
-        let lident = Located.mk (lident_of_path path) in
-        ptyp_constr lident (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys)
-      | Tvariant { row_fields; row_closed; _ } ->
-        (* Polymorphic variants:
+      let lident = Located.mk (lident_of_path path) in
+      ptyp_constr lident (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys)
+    | Tvariant { row_fields; row_closed; _ } ->
+      (* Polymorphic variants:
         
            Determining the [closed_flag] is simple, since the [row_desc] type
            contains [row_closed] [bool]. 
@@ -223,259 +186,204 @@ module Payload = struct
            - [Reither (constr:bool, tys, _, _)]: [constr] denotes whether field is a constant (empty) constructor, [tys] is a list of [type_expr]
            - [Rabsent] is used for merging '&' constraints in poylmorphic viarants (hence we ignore it).
         *)
-        let closed_flag = if row_closed then Closed else Open in
-        let fields =
-          row_fields
-          |> List.filter_map ~f:(fun (label, row_field) ->
-                 let label = Located.mk label in
-                 match row_field with
-                 | Rpresent None -> Some (rtag label true [])
-                 | Rpresent (Some ty) ->
-                   Some (rtag label false [ pcore_type_of_ttype_expr ~loc ty ])
-                 | Reither (constr, tys, _, _) ->
-                   Some (rtag label constr (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys))
-                 | _ -> None)
-        in
-        ptyp_variant fields closed_flag None
-      | Tpackage (path, lidents, tys) ->
-        (* Package consists of a module path [path] and a list of type constraints, 
+      let closed_flag = if row_closed then Closed else Open in
+      let fields =
+        row_fields
+        |> List.filter_map ~f:(fun (label, row_field) ->
+               let label = Located.mk label in
+               match row_field with
+               | Rpresent None -> Some (rtag label true [])
+               | Rpresent (Some ty) -> Some (rtag label false [ pcore_type_of_ttype_expr ~loc ty ])
+               | Reither (constr, tys, _, _) ->
+                 Some (rtag label constr (List.map ~f:(pcore_type_of_ttype_expr ~loc) tys))
+               | _ -> None)
+      in
+      ptyp_variant fields closed_flag None
+    | Tpackage (path, lidents, tys) ->
+      (* Package consists of a module path [path] and a list of type constraints, 
            defined by [lidents] and [tys] (newer compiler verisions 
            provide a zipped list). 
         
            Examples: (module S) or (module S with type t1 = T1 and ...)
         *)
-        let lident_tys =
-          List.map2_exn lidents tys ~f:(fun lident ty ->
-              Located.mk lident, pcore_type_of_ttype_expr ~loc ty)
-        in
-        ptyp_package (Located.mk (lident_of_path path), lident_tys)
-      | Tpoly (ty, tys) ->
-        (* Polymorphic type (forall):
+      let lident_tys =
+        List.map2_exn lidents tys ~f:(fun lident ty ->
+            Located.mk lident, pcore_type_of_ttype_expr ~loc ty)
+      in
+      ptyp_package (Located.mk (lident_of_path path), lident_tys)
+    | Tpoly (ty, tys) ->
+      (* Polymorphic type (forall):
 
            [tys] is the list of type variables (hence should be [Tunivar]s) 
            and [ty] is the qualified type. 
            
            Example: ('a 'b 'c) ty
         *)
-        let tvs =
-          tys
-          |> List.filter_map ~f:(fun ty ->
-                 match ty.desc with
-                 | Tunivar tv -> Option.(tv >>| Located.mk)
-                 | _ -> None)
-        in
-        ptyp_poly tvs (pcore_type_of_ttype_expr ~loc ty)
-      | Tnil | Tfield _ | Tobject _ ->
-        (* [Tnil], [Tfield] and [Tobject] are used for object types (not supported) *)
-        raise_errorf ~loc "[%%open]: object types are not supported."
-      | Tlink _ | Tsubst _ ->
-        (* [Tlink] and [Tsubst] are used internally by the compiler. *)
-        assert false
-
-
-    let plabel_decl_of_tlabel_decl ~loc label =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      let name = Located.mk (Ident.name label.ld_id) in
-      label_declaration
-        ~name
-        ~mutable_:(Migrate.mutable_flag label.ld_mutable)
-        ~type_:(pcore_type_of_ttype_expr ~loc label.ld_type)
-
-
-    let pconstr_decl_of_tconstr_decl ~loc constr =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      let name = Located.mk (Ident.name constr.cd_id) in
-      let args =
-        match constr.cd_args with
-        | Cstr_tuple tys -> Pcstr_tuple (List.map tys ~f:(pcore_type_of_ttype_expr ~loc))
-        | Cstr_record labels -> Pcstr_record (List.map labels ~f:(plabel_decl_of_tlabel_decl ~loc))
+      let tvs =
+        tys
+        |> List.filter_map ~f:(fun ty ->
+               match ty.desc with
+               | Tunivar tv -> Option.(tv >>| Located.mk)
+               | _ -> None)
       in
-      let res = Option.(constr.cd_res >>| pcore_type_of_ttype_expr ~loc) in
-      constructor_declaration ~name ~args ~res
+      ptyp_poly tvs (pcore_type_of_ttype_expr ~loc ty)
+    | Tnil | Tfield _ | Tobject _ ->
+      (* [Tnil], [Tfield] and [Tobject] are used for object types (not supported) *)
+      raise_errorf ~loc "[%%open]: object types are not supported."
+    | Tlink _ | Tsubst _ ->
+      (* [Tlink] and [Tsubst] are used internally by the compiler. *)
+      assert false
 
 
-    let ptype_kind_of_ttype_decl_kind ~loc kind =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      match kind with
-      | Type_abstract -> Ptype_abstract
-      | Type_open -> Ptype_open
-      | Type_record (labels, _) ->
-        Ptype_record (List.map labels ~f:(plabel_decl_of_tlabel_decl ~loc))
-      | Type_variant constrs ->
-        Ptype_variant (List.map constrs ~f:(pconstr_decl_of_tconstr_decl ~loc))
+  let plabel_decl_of_tlabel_decl ~loc label =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    let name = Located.mk (Ident.name label.ld_id) in
+    label_declaration
+      ~name
+      ~mutable_:(Migrate.mutable_flag label.ld_mutable)
+      ~type_:(pcore_type_of_ttype_expr ~loc label.ld_type)
 
 
-    let ptype_params_and_cstrs_of_ttype_params ~loc params =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      let fresh_tvar =
-        let i = ref 0 in
-        fun () ->
-          let tv = "a" ^ Int.to_string !i in
-          Int.incr i;
-          ptyp_var tv
-      in
-      let params, constraints =
-        params
-        |> List.map ~f:(fun param ->
-               match param.desc with
-               | Tvar _ -> (pcore_type_of_ttype_expr ~loc param, (NoVariance, NoInjectivity)), None
-               | _ ->
-                 let tv = fresh_tvar () in
-                 ( (tv, (NoVariance, NoInjectivity))
-                 , Some (tv, pcore_type_of_ttype_expr ~loc param, loc) ))
-        |> List.unzip
-      in
-      params, List.filter_opt constraints
-
-
-    let open_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      match ttype_decl.type_private with
-      | Private -> raise_errorf "[%%open]: cannot open a private type."
-      | Public ->
-        let name = Located.mk name in
-        let params, cstrs = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
-        let kind = ptype_kind_of_ttype_decl_kind ~loc ttype_decl.type_kind in
-        let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
-        type_declaration ~name ~params ~cstrs ~kind ~manifest ~private_:Public
-
-
-    let closed_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      let params, _ = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
-      let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
-      type_declaration
-        ~name:(Located.mk name)
-        ~params
-        ~kind:Ptype_abstract
-        ~manifest
-        ~private_:Public
-        ~cstrs:[]
-
-
-    let expand ~loc mod_ident { type_ident; type_alias; type_kind } =
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      let name = Option.value type_alias ~default:type_ident in
-      let ttype_decl = find_type ~loc (Lazy.force_val env) mod_ident type_ident in
-      let ptype_lident = Ldot (mod_ident, type_ident) in
-      let ptype_decl =
-        match type_kind with
-        | Kind_closed -> closed_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl
-        | Kind_open -> open_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl
-      in
-      pstr_type Nonrecursive [ ptype_decl ]
-  end
-
-  module Value = struct
-    type t =
-      { val_ident : string
-      ; val_alias : string option
-      }
-
-    (** [pattern] defines then [Ast_pattern.t] for the 
-        [Value.t] payload within the [%%open ...] extension hook.
-        
-        We define the following syntax for a value:
-          value  ::= ident [attrs] 
-          attrs ::= [@as ident]
-          ident ::= Lident string 
-    *)
-    let pattern () =
-      let open Ast_pattern in
-      let ident () = pexp_ident (lident __) in
-      let as_attr =
-        attribute ~name:(string "as") ~payload:(pstr (pstr_eval (ident ()) nil ^:: nil))
-      in
-      let attrs = as_attr ^:: nil in
-      let value = alt_option (pexp_attributes attrs (ident ())) (ident ()) in
-      value |> map2 ~f:(fun val_alias val_ident -> { val_ident; val_alias })
-
-
-    let expand mod_ident ~loc { val_ident; val_alias } =
-      let ident = val_alias |> Option.value ~default:val_ident in
-      let (module B) = Ast_builder.make loc in
-      let open B in
-      pstr_value
-        Nonrecursive
-        [ value_binding
-            ~pat:(ppat_var (Located.mk ident))
-            ~expr:(pexp_ident (Located.mk (Ldot (mod_ident, val_ident))))
-        ]
-  end
-
-  module Item = struct
-    type t =
-      | Type of Type.t
-      | Value of Value.t
-
-    let pattern () =
-      let open Ast_pattern in
-      Value.pattern ()
-      |> map1 ~f:(fun v -> Value v)
-      ||| (Type.pattern () |> map1 ~f:(fun t -> Type t))
-
-
-    let expand ~loc mod_ident item =
-      match item with
-      | Type t -> Type.expand ~loc mod_ident t
-      | Value v -> Value.expand ~loc mod_ident v
-  end
-
-  type t =
-    { open_mod_ident : Longident.t
-    ; open_items : Item.t list
-    }
-
-  (** [pattern] defines then [Ast_pattern.t] for the 
-      [Open.t] payload within the [%%open ...] extension hook.
-    
-    We define the following syntax for the 
-    payload of the [%%open ...] extension hook:
-      payload ::= mod_ident.( items ) 
-      items   ::= item | item, items
-      item    ::= value | type
- *)
-  let pattern () =
-    let open Ast_pattern in
-    let items =
-      Item.pattern () |> map1 ~f:(fun item -> [ item ]) ||| pexp_tuple (many (Item.pattern ()))
+  let pconstr_decl_of_tconstr_decl ~loc constr =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    let name = Located.mk (Ident.name constr.cd_id) in
+    let args =
+      match constr.cd_args with
+      | Cstr_tuple tys -> Pcstr_tuple (List.map tys ~f:(pcore_type_of_ttype_expr ~loc))
+      | Cstr_record labels -> Pcstr_record (List.map labels ~f:(plabel_decl_of_tlabel_decl ~loc))
     in
-    let mod_ident = open_infos ~override:fresh ~expr:(pmod_ident __) in
-    pstr (pstr_eval (pexp_open mod_ident items) nil ^:: nil)
-    |> map2 ~f:(fun open_mod_ident open_items -> { open_mod_ident; open_items })
+    let res = Option.(constr.cd_res >>| pcore_type_of_ttype_expr ~loc) in
+    constructor_declaration ~name ~args ~res
 
 
-  let expand_ocamldep ~loc { open_mod_ident; _ } =
+  let ptype_kind_of_ttype_decl_kind ~loc kind =
     let (module B) = Ast_builder.make loc in
     let open B in
-    pstr_open (open_infos ~override:Fresh ~expr:(pmod_ident (Located.mk open_mod_ident)))
+    match kind with
+    | Type_abstract -> Ptype_abstract
+    | Type_open -> Ptype_open
+    | Type_record (labels, _) -> Ptype_record (List.map labels ~f:(plabel_decl_of_tlabel_decl ~loc))
+    | Type_variant constrs ->
+      Ptype_variant (List.map constrs ~f:(pconstr_decl_of_tconstr_decl ~loc))
 
 
-  let expand ~loc { open_mod_ident; open_items } =
+  let ptype_params_and_cstrs_of_ttype_params ~loc params =
     let (module B) = Ast_builder.make loc in
     let open B in
-    let value_bindings = List.map ~f:(Item.expand ~loc open_mod_ident) open_items in
-    pstr_open (open_infos ~override:Fresh ~expr:(pmod_structure value_bindings))
+    let fresh_tvar =
+      let i = ref 0 in
+      fun () ->
+        let tv = "a" ^ Int.to_string !i in
+        Int.incr i;
+        ptyp_var tv
+    in
+    let params, constraints =
+      params
+      |> List.map ~f:(fun param ->
+             match param.desc with
+             | Tvar _ -> (pcore_type_of_ttype_expr ~loc param, (NoVariance, NoInjectivity)), None
+             | _ ->
+               let tv = fresh_tvar () in
+               (tv, (NoVariance, NoInjectivity)), Some (tv, pcore_type_of_ttype_expr ~loc param, loc))
+      |> List.unzip
+    in
+    params, List.filter_opt constraints
+
+
+  let open_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    match ttype_decl.type_private with
+    | Private -> raise_errorf "[%%open]: cannot open a private type."
+    | Public ->
+      let name = Located.mk name in
+      let params, cstrs = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
+      let kind = ptype_kind_of_ttype_decl_kind ~loc ttype_decl.type_kind in
+      let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
+      type_declaration ~name ~params ~cstrs ~kind ~manifest ~private_:Public
+
+
+  let closed_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    let params, _ = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
+    let manifest = Some (ptyp_constr (Located.mk ptype_lident) (fst (List.unzip params))) in
+    type_declaration
+      ~name:(Located.mk name)
+      ~params
+      ~kind:Ptype_abstract
+      ~manifest
+      ~private_:Public
+      ~cstrs:[]
+
+
+  let expand ~loc mod_ident { type_ident; type_alias; type_kind } =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    let name = Option.value type_alias ~default:type_ident in
+    let ttype_decl = find_type ~loc (Lazy.force_val env) mod_ident type_ident in
+    let ptype_lident = Ldot (mod_ident, type_ident) in
+    let ptype_decl =
+      match type_kind with
+      | Kind_closed -> closed_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl
+      | Kind_open -> open_ptype_decl_of_ttype_decl ~loc name ptype_lident ttype_decl
+    in
+    pstr_type Nonrecursive [ ptype_decl ]
 end
 
-let pattern = Payload.pattern ()
+module Value = struct
+  include Parsed.Value
 
-let expand ~ctxt payload =
-  let tool_name = Expansion_context.Extension.tool_name ctxt in
+  let expand mod_ident ~loc { val_ident; val_alias } =
+    let ident = val_alias |> Option.value ~default:val_ident in
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    pstr_value
+      Nonrecursive
+      [ value_binding
+          ~pat:(ppat_var (Located.mk ident))
+          ~expr:(pexp_ident (Located.mk (Ldot (mod_ident, val_ident))))
+      ]
+end
+
+module Item = struct
+  include Parsed.Item
+
+  let expand ~loc mod_ident item =
+    match item with
+    | Type t -> Type.expand ~loc mod_ident t
+    | Value v -> Value.expand ~loc mod_ident v
+end
+
+module Payload = struct
+  include Parsed.Payload
+
+  let expand ~loc ~tool_name { open_mod_ident; open_items } =
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    if String.equal tool_name "ocamldep"
+    then pstr_open (open_infos ~override:Fresh ~expr:(pmod_ident (Located.mk open_mod_ident)))
+    else (
+      let value_bindings = List.map ~f:(Item.expand ~loc open_mod_ident) open_items in
+      pstr_open (open_infos ~override:Fresh ~expr:(pmod_structure value_bindings)))
+end
+
+let pattern = 
+  let open Ast_pattern in
+  pstr (pstr_eval (estring __) nil ^:: nil)
+
+let expand ~ctxt payload_string =
   let loc = Expansion_context.Extension.extension_point_loc ctxt in
-  let expander =
-    if String.equal tool_name "ocamldep" then Payload.expand_ocamldep else Payload.expand
+  let payload =
+    match Parse.payload (Lexing.from_string payload_string) with
+    | Ok payload -> payload
+    | Error message -> raise_errorf ~loc "%s" message
   in
-  expander ~loc payload
+  let tool_name = Expansion_context.Extension.tool_name ctxt in
+  Payload.expand ~tool_name ~loc payload
 
 
 let open_extension = Extension.V3.declare name Extension.Context.structure_item pattern expand
-let open_rule = Context_free.Rule.extension open_extension
-let () = Driver.register_transformation ~rules:[ open_rule ] name
+let () = Driver.register_transformation ~extensions:[ open_extension ] name
