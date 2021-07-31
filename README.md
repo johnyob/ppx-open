@@ -14,7 +14,7 @@ of a given module.
 
 For instance, the following code:
 ```ocaml
-[%%open Module_foo.(val1, val2 [@as renamed1], [%type] type1, Mod1, Mod_type1)]
+{%%open| Module_foo.(val1, val2 as renamed1, type type1, module Mod1, module type Mod_type1) |}
 ```
 is rewritten into: 
 ```ocaml
