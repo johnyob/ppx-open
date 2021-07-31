@@ -22,7 +22,7 @@ rule token = parse
 
     (* | "exposing"        { EXPOSING } *)
     | "type"            { TYPE }
-    (* | "module"          { MODULE } *)
+    | "module"          { MODULE }
     | "as"              { AS }
 
     | lid               { LOWER_IDENT (Lexing.lexeme lexbuf) }

@@ -10,7 +10,7 @@ open Parsed
 // Keywords
 // %token EXPOSING
 %token TYPE
-// %token MODULE
+%token MODULE
 %token AS
 
 %token EOF
@@ -20,26 +20,35 @@ open Parsed
 %token <string> UPPER_IDENT
 
 
-%start payload
+%start open_payload
 
-%type <Payload.t> payload
 %type <Payload.t> open_payload
+%type <Payload.t> open_payload_inner
+
 %type <Item.t> open_item
+
 %type <Value.t> val_item
+
 %type <Type.t> type_item
 %type <Type.kind> type_item_kind
 
+%type <Module.t> mod_item
+
+%type <Module_type.t> mod_type_item
+
 %%
 
-payload:
-  | open_payload EOF  { $1 }
-
 open_payload:
+  | open_payload_inner EOF  { $1 }
+
+open_payload_inner:
   | mod_longident DOT LPAREN separated_list(COMMA, open_item) RPAREN { Payload.{ open_mod_ident=$1; open_items=$4 } } 
 
 open_item:
-  | type_item { Item.Type $1 }
-  | val_item  { Item.Value $1 }
+  | type_item     { Item.Type $1 }
+  | val_item      { Item.Value $1 }
+  | mod_item      { Item.Module $1 }
+  | mod_type_item { Item.Module_type $1 }
 
 
 val_item:
@@ -47,6 +56,12 @@ val_item:
 
 type_item:
   | TYPE type_ident type_item_kind as_(type_ident)  { Type.{ type_ident=$2; type_kind=$3; type_alias=$4 } }
+
+mod_item:
+  | MODULE mod_ident as_(mod_ident)   { Module.{ mod_ident=$2; mod_alias=$3 } }
+
+mod_type_item:
+  | MODULE TYPE mod_ident as_(mod_ident)  { Module_type.{ mod_type_ident=$3; mod_type_alias=$4 } }
 
 /* Type Kinds
  * ----------
@@ -99,8 +114,8 @@ val_ident:
 type_ident:
   | LOWER_IDENT { $1 }
 
-// mod_ident:
-//   | UPPER_IDENT { $1 }
+mod_ident:
+  | UPPER_IDENT { $1 }
 
 mod_longident:
   | longident_(mod_longident, UPPER_IDENT) { $1 }

@@ -11,6 +11,6 @@ let show_position lexbuf =
 
 let payload lexbuf =
   let open Result in
-  try Ok (Parser.payload Lexer.token lexbuf) with
+  try Ok (Parser.open_payload Lexer.token lexbuf) with
   | Error msg -> Error msg
   | Parser.Error -> Error "syntax error"

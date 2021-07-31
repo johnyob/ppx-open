@@ -1,15 +1,33 @@
 open Base
 open Ppxlib
 open Ocaml_common
-
 module Parse = Ppx_open_parsing.Parse
 module Parsed = Ppx_open_parsing.Parsed
 
 let name = "open"
 let raise_errorf = Location.raise_errorf
 
-module Module_type = struct end
-module Module = struct end
+module Module = struct
+  include Parsed.Module
+
+  let expand parent_mod_ident ~loc { mod_ident; mod_alias } =
+    let ident = mod_alias |> Option.value ~default:mod_ident in
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    let expr = pmod_ident (Located.mk (Ldot (parent_mod_ident, mod_ident))) in
+    pstr_module (module_binding ~name:(Located.mk (Some ident)) ~expr)
+end
+
+module Module_type = struct
+  include Parsed.Module_type
+
+  let expand mod_ident ~loc { mod_type_ident; mod_type_alias } =
+    let ident = mod_type_alias |> Option.value ~default:mod_type_ident in
+    let (module B) = Ast_builder.make loc in
+    let open B in
+    let type_ = Some (pmty_ident (Located.mk (Ldot (mod_ident, mod_type_ident)))) in
+    pstr_modtype (module_type_declaration ~name:(Located.mk ident) ~type_)
+end
 
 module Type = struct
   include Parsed.Type
@@ -355,6 +373,8 @@ module Item = struct
     match item with
     | Type t -> Type.expand ~loc mod_ident t
     | Value v -> Value.expand ~loc mod_ident v
+    | Module m -> Module.expand ~loc mod_ident m
+    | Module_type mty -> Module_type.expand ~loc mod_ident mty
 end
 
 module Payload = struct
@@ -370,9 +390,10 @@ module Payload = struct
       pstr_open (open_infos ~override:Fresh ~expr:(pmod_structure value_bindings)))
 end
 
-let pattern = 
+let pattern =
   let open Ast_pattern in
   pstr (pstr_eval (estring __) nil ^:: nil)
+
 
 let expand ~ctxt payload_string =
   let loc = Expansion_context.Extension.extension_point_loc ctxt in

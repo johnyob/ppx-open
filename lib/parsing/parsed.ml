@@ -1,5 +1,22 @@
 open Ppxlib
 
+module Module = struct
+  type t = 
+    { mod_ident : string
+    ; mod_alias : string option
+    }
+  [@@deriving eq, show]
+end
+
+module Module_type = struct
+  type t = 
+    { mod_type_ident : string
+    ; mod_type_alias : string option
+    }
+  [@@deriving eq, show]
+end
+
+
 module Value = struct
   type t =
     { val_ident : string
@@ -26,6 +43,8 @@ module Item = struct
   type t =
     | Type of Type.t
     | Value of Value.t
+    | Module of Module.t
+    | Module_type of Module_type.t
   [@@deriving eq, show]
 end
 
