@@ -15,7 +15,7 @@
 
 (package
  (name ppx_open)
- (synopsis "")
+ (synopsis "Idiomatic selective `open`s in OCaml")
  (description
   "A ppx rewriter that provides idiomatic selective `open`s in OCaml.")
  (depends
