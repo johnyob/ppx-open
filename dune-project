@@ -26,5 +26,6 @@
   (ppxlib
    (>= 0.22.2))
   (base
-   (>= 0.14.1))))
+   (>= 0.14.1))
+  menhir))
 (using menhir 2.1)
