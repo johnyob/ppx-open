@@ -2,7 +2,7 @@
  (name pp)
  (public_name pp)
  (modules pp)
- (libraries ppx_open ppxlib))
+ (libraries ppx_open ppxlib ppxlib.metaquot))
 
 (rule
  (targets test.actual.ml)
@@ -21,5 +21,7 @@
 (test
  (name test)
  (modules test)
+ (flags (:standard -w -32)) 
  (preprocess
   (pps ppx_open)))
+
