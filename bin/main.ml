@@ -1,24 +1,35 @@
-let () = print_endline "Hello, World!"
-
-
 module Foo = struct
   let val1 = 1
+
+  module type S = sig
+    type z = Z
+    type _ s = S
+
+    type _ t =
+      | Zero : z t
+      | Succ : 'n t -> 'n s t
+  end
 end
 
-[%%open Foo.(val1 [@as renamed1])]
+{%%open| Foo.(val1 as renamed1, module type S as Nat) |}
 
 let () = print_endline (string_of_int renamed1)
 
-module Bar = struct
+module Nat_impl : Nat = struct
+  type z = Z
+  type _ s = S
 
-  type t = A | B | C
-
-  let to_string = function
-  | A -> "A"
-  | B -> "B"
-  | C -> "C"
+  type _ t =
+    | Zero : z t
+    | Succ : 'n t -> 'n s t
 end
 
-[%%open Bar.([%type] t [@as bar])]
+{%%open| Bar.FooBar.(type t (..) as bar1) |}
 
-let () = print_endline (Bar.to_string A)
+type foo = bar1 list
+
+let x = A
+
+let () =
+  print_endline
+    (Bar.FooBar.to_string x)
