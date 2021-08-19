@@ -314,7 +314,7 @@ module Type = struct
     let (module B) = Ast_builder.make loc in
     let open B in
     match ttype_decl.type_private with
-    | Private -> raise_errorf "[%%open]: cannot open a private type."
+    | Private -> raise_errorf ~loc "[%%open]: cannot open a private type."
     | Public ->
       let name = Located.mk name in
       let params, cstrs = ptype_params_and_cstrs_of_ttype_params ~loc ttype_decl.type_params in
