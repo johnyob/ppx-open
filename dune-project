@@ -20,7 +20,7 @@
   "A ppx rewriter that provides idiomatic selective `open`s in OCaml.")
  (depends
   (ocaml
-   (>= 4.12.0))
+   (= 4.12.0))
   (dune
    (>= 2.8))
   (ppxlib
